@@ -2618,6 +2618,10 @@ std::vector<SpellbookEntryData> BuildSpellbookEntries(Player* bot)
         if (!spellInfo || spellInfo->IsPassive() || !spellInfo->SpellName[0])
             continue;
 
+        // The client's own spellbook leaves out hidden spells and trade skill recipes.
+        if (spellInfo->HasAttribute(SPELL_ATTR0_DO_NOT_DISPLAY) || spellInfo->HasAttribute(SPELL_ATTR0_IS_TRADESKILL))
+            continue;
+
         if (IsSpellbookExcludedSpell(it->first))
             continue;
 
