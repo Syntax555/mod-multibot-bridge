@@ -16,6 +16,7 @@
 #include "NPCPackets.h"
 #include "ObjectAccessor.h"
 #include "ObjectGuid.h"
+#include "ObjectDefines.h"
 #include "ObjectMgr.h"
 #include "Player.h"
 #include "QuestPackets.h"
@@ -35,6 +36,7 @@
 #include "AiObjectContext.h"
 #include "AiFactory.h"
 #include "EraTalentBridge.h"
+#include "MultiBotBridgeProgression.h"
 #include "Event.h"
 #include "EventProcessor.h"
 #include "Strategy.h"
@@ -268,6 +270,8 @@ char const* const kInventoryOpenCapability = "INVENTORY_OPEN_V1";
 char const* const kLootRuleItemCapability = "LOOT_RULE_ITEM_V1";
 char const* const kQuestProgressCapability = "QUEST_PROGRESS_V1";
 char const* const kQuestProgressPushCapability = "QUEST_PROGRESS_PUSH_V1";
+char const* const kIpProgressCapability = "IP_PROGRESS_V1";
+char const* const kIpTargetCapability = "IP_TARGET_V1";
 char const* const kQuestAbandonCapability = "QUEST_ABANDON_V1";
 char const* const kQuestAbandonTargetCapability = "QUEST_ABANDON_TARGET_V1";
 char const* const kTalentApplyCapability = "TALENT_APPLY_V1";
@@ -455,6 +459,8 @@ bool SendCapabilitiesPackets(Player* player, ChatMsg chatType)
         kLootRuleItemCapability,
         kQuestProgressCapability,
         kQuestProgressPushCapability,
+        kIpProgressCapability,
+        kIpTargetCapability,
         kQuestAbandonCapability,
         kQuestAbandonTargetCapability,
         kTalentApplyCapability,
@@ -2330,6 +2336,181 @@ void UpdateQuestProgress(uint32 diff)
 }
 
 // MB_QUEST_PROGRESS_V1_END
+
+// MB_IP_PROGRESS_V1_BEGIN
+// BEGIN, comma-joined items within the wire budget, END with the item count.
+std::vector<std::pair<std::string, std::string>> BuildIpListPackets(std::string const& opcode,
+    std::string const& token, std::vector<std::string> const& items)
+{
+    std::vector<std::pair<std::string, std::string>> packets;
+    std::string const header = token + kFieldSeparator;
+    packets.emplace_back(opcode + "_BEGIN", header + std::to_string(items.size()));
+    std::string chunk;
+    for (std::string const& item : items)
+    {
+        if (!chunk.empty() && !IsAddonPacketWithinBudget(opcode, header + chunk + ',' + item))
+        {
+            packets.emplace_back(opcode, header + chunk);
+            chunk.clear();
+        }
+        chunk += (chunk.empty() ? "" : ",") + item;
+        if (!IsAddonPacketWithinBudget(opcode, header + chunk))
+            return {};
+    }
+    if (!chunk.empty())
+        packets.emplace_back(opcode, header + chunk);
+    packets.emplace_back(opcode + "_END", header + std::to_string(items.size()));
+    return packets;
+}
+
+struct IpProgressRequester
+{
+    QuestProgressClock::time_point windowStart;
+    QuestProgressClock::time_point lastSeen;
+    std::size_t requests = 0;
+    std::string watchToken;
+    QuestProgressClock::time_point watchExpires;
+    std::string watched;
+};
+
+// Chat requests and WorldScript::OnUpdate both run on the world thread.
+// Only the sender can watch; inspected altbot answers are requested on demand.
+std::map<ObjectGuid, IpProgressRequester> ipProgressRequesters;
+
+Player* FindIpProgressTarget(Player* requester, std::string const& name)
+{
+    Player* target = FindBotByName(requester, name);
+    if (!requester->IsInWorld() || !requester->GetSession() || requester->GetSession()->IsSocketClosed() ||
+        !target || target == requester || !target->IsInWorld() || !target->GetSession() ||
+        !requester->GetGroup() ||
+        target->GetGroup() != requester->GetGroup() ||
+        !requester->IsWithinDistInMap(target, INSPECT_DISTANCE, false) || requester->IsValidAttackTarget(target))
+        return nullptr;
+    PlayerbotAI* ai = GetBotAI(target);
+    return ai && ai->IsAltBot() && ai->GetMaster() == requester ? target : nullptr;
+}
+
+void HandleIpProgressRequest(Player* player, std::string const& requestType,
+    std::vector<std::string> const& fields, std::string const& targetName)
+{
+    ChatMsg const replyType = CHAT_MSG_WHISPER;
+    std::string const& token = fields[1];
+    auto const now = QuestProgressClock::now();
+    if (!ipProgressRequesters.contains(player->GetGUID()) && ipProgressRequesters.size() >= 512)
+    {
+        SendProtocolError(player, replyType, "GET", requestType, token, "RATE_LIMIT");
+        return;
+    }
+    IpProgressRequester& requester = ipProgressRequesters[player->GetGUID()];
+    requester.lastSeen = now;
+    if (now - requester.windowStart >= std::chrono::seconds(2))
+    {
+        requester.windowStart = now;
+        requester.requests = 0;
+    }
+    if (++requester.requests > 20)
+    {
+        SendProtocolError(player, replyType, "GET", requestType, token, "RATE_LIMIT");
+        return;
+    }
+
+    Player* subject = targetName.empty() ? player : FindIpProgressTarget(player, targetName);
+    if (!subject)
+    {
+        SendProtocolError(player, replyType, "GET", requestType, token, "BOT_UNAVAILABLE");
+        return;
+    }
+
+    if (requestType == "IP_STATE")
+    {
+        if (fields.size() == 3 && fields[2] == "UNWATCH")
+        {
+            if (requester.watchToken == token)
+                requester.watchToken.clear();
+            return;
+        }
+        std::string const state = MultiBotBridgeProgression::State(subject);
+        if (fields.size() == 3)
+        {
+            requester.watchToken = token;
+            requester.watchExpires = now + std::chrono::seconds(180);
+            requester.watched = state;
+        }
+        SendAddonPacket(player, replyType, "IP_STATE", token + kFieldSeparator + state);
+        if (subject != player)
+            SendAddonPacket(player, replyType, "IP_TARGET", token + kFieldSeparator +
+                AiFactory::GetEffectiveCombatProfile(subject) + kFieldSeparator + (subject->CanDualWield() ? "1" : "0"));
+        return;
+    }
+
+    std::vector<std::string> items;
+    if (requestType == "IP_QUESTS")
+    {
+        std::istringstream list(fields[2]);
+        for (std::string field; std::getline(list, field, ',');)
+        {
+            uint32 questId = 0;
+            if (items.size() >= 32 || !TryParseUint32Field(field, 1, 9999999, questId))
+            {
+                SendProtocolError(player, replyType, "GET", requestType, token, "BAD_QUEST");
+                return;
+            }
+            items.push_back(MultiBotBridgeProgression::Quest(subject, questId, subject != player));
+        }
+        if (items.empty())
+        {
+            SendProtocolError(player, replyType, "GET", requestType, token, "BAD_QUEST");
+            return;
+        }
+    }
+    else
+        items = MultiBotBridgeProgression::Access(subject);
+
+    auto const packets = BuildIpListPackets(requestType, token, items);
+    if (packets.empty())
+    {
+        SendProtocolError(player, replyType, "GET", requestType, token, "PACKET_TOO_LARGE");
+        return;
+    }
+    for (auto const& packet : packets)
+        SendAddonPacket(player, replyType, packet.first, packet.second);
+}
+
+// Once per second, push a changed state to each watching character. Leases
+// last 180 seconds; requester state ends with the session or after idling.
+void UpdateIpProgress(uint32 diff)
+{
+    static uint32 elapsed = 0;
+    elapsed += std::min(diff, uint32(1000));
+    if (elapsed < 1000)
+        return;
+    elapsed = 0;
+    auto const now = QuestProgressClock::now();
+    for (auto it = ipProgressRequesters.begin(); it != ipProgressRequesters.end();)
+    {
+        Player* const player = ObjectAccessor::FindConnectedPlayer(it->first);
+        IpProgressRequester& requester = it->second;
+        if (!player || !player->GetSession() || player->GetSession()->IsSocketClosed() ||
+            now - requester.lastSeen >= std::chrono::seconds(180))
+        {
+            it = ipProgressRequesters.erase(it);
+            continue;
+        }
+        if (!requester.watchToken.empty() && now >= requester.watchExpires)
+            requester.watchToken.clear();
+        if (!requester.watchToken.empty() && player->IsInWorld())
+        {
+            std::string const state = MultiBotBridgeProgression::State(player);
+            if (state != requester.watched)
+            {
+                requester.watched = state;
+                SendAddonPacket(player, CHAT_MSG_WHISPER, "IP_STATE", requester.watchToken + kFieldSeparator + state);
+            }
+        }
+        ++it;
+    }
+}
+// MB_IP_PROGRESS_V1_END
 
 void AppendGameObjectUnitLines(PlayerbotAI* botAI, std::vector<std::string>& lines, std::string const& title, std::string const& valueName)
 {
@@ -20533,6 +20714,30 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
             HandleQuestProgressRequest(player, CHAT_MSG_WHISPER, fields[1], fields[2], fields.size() == 4 ? fields[3] : "");
             return true;
         }
+        if (requestType == "IP_STATE" || requestType == "IP_QUESTS" || requestType == "IP_ACCESS")
+        {
+            std::string const token = GetSafeErrorToken(fields, 1);
+            std::size_t const baseCount = requestType == "IP_QUESTS" ? 3 : 2;
+            bool const targeted = fields.size() == baseCount + 2 && fields[baseCount] == "BOT";
+            bool const fieldCount = targeted || fields.size() == baseCount ||
+                (requestType == "IP_STATE" && fields.size() == 3);
+            if (!fieldCount)
+                return SendProtocolError(player, CHAT_MSG_WHISPER, normalized, requestType, token, "BAD_FIELD_COUNT");
+            if (!IsValidRequestToken(fields[1]))
+                return SendProtocolError(player, CHAT_MSG_WHISPER, normalized, requestType, "", "BAD_TOKEN");
+            if (requestType == "IP_STATE" && fields.size() == 3 && fields[2] != "WATCH" && fields[2] != "UNWATCH")
+                return SendProtocolError(player, CHAT_MSG_WHISPER, normalized, requestType, token, "BAD_MODE");
+            std::string targetName;
+            std::vector<std::string> requestFields = fields;
+            if (targeted)
+            {
+                if (!TryUrlDecodeField(fields.back(), targetName, kMaxBotNameLength, false) || targetName != Trim(targetName))
+                    return SendProtocolError(player, CHAT_MSG_WHISPER, normalized, requestType, token, "BAD_BOT_NAME");
+                requestFields.resize(baseCount);
+            }
+            HandleIpProgressRequest(player, requestType, requestFields, targetName);
+            return true;
+        }
         // MB_INVENTORY_H1B1A_GET_EQUIP_OBSERVE_V1_BEGIN
         if (requestType == "EQUIP_OBSERVE")
         {
@@ -22572,6 +22777,7 @@ public:
     void OnUpdate(uint32 diff) override
     {
         UpdateQuestProgress(diff);
+        UpdateIpProgress(diff);
     }
 };
 
