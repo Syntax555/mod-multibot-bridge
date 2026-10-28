@@ -1,3 +1,22 @@
+## Portable assembly integration
+
+This **MultiBot Bridge** fork is maintained for
+[AzerothCore Playerbots Portable](https://github.com/Syntax555/mod-playerbots-portable/blob/main/README.md). Its original upstream is
+[Wishmaster117/mod-multibot-bridge](https://github.com/Wishmaster117/mod-multibot-bridge), imported at
+[`ebfa01a129dd`](https://github.com/Wishmaster117/mod-multibot-bridge/commit/ebfa01a129dd4c441b2527e42dcc37b6da95e6c2).
+The assembly pins a tested commit of this fork's `main` branch in
+[`versions.lock.json`](https://github.com/Syntax555/mod-playerbots-portable/blob/main/versions.lock.json), together with its matching core and modules.
+
+Use the assembly's [installation and build instructions](https://github.com/Syntax555/mod-playerbots-portable/blob/main/README.md),
+[module catalog](https://github.com/Syntax555/mod-playerbots-portable/blob/main/docs/module-versions.md#server-modules) and
+[Client addon integration](https://github.com/Syntax555/mod-playerbots-portable/blob/main/docs/addons.md). Before contributing, read its
+[repository rules](https://github.com/Syntax555/mod-playerbots-portable/blob/main/AGENTS.md) and [fork workflow](https://github.com/Syntax555/mod-playerbots-portable/blob/main/CONTRIBUTING.md#changing-the-server).
+The **Portable integration** workflow checks this fork's current commit against
+the assembly's pinned dependencies with the relevant production fixtures.
+
+---
+
+
 <div align="center">
 
 # mod-multibot-bridge
