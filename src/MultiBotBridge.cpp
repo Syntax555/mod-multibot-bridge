@@ -14,6 +14,7 @@
 #include "ItemPackets.h"
 #include "ItemUsageValue.h"
 #include "LootObjectStack.h"
+#include "NPCPackets.h"
 #include "ObjectAccessor.h"
 #include "ObjectGuid.h"
 #include "ObjectMgr.h"
@@ -4234,7 +4235,7 @@ PlayerbotAI* GetBotAI(Player* bot)
     return sPlayerbotsMgr.GetPlayerbotAI(bot);
 }
 
-Creature* FindNearbyNpcWithFlag(Player* bot, uint32 npcFlag)
+Creature* FindNearbyNpcWithFlag(Player* bot, uint32 npcFlag, bool requireInteraction = false)
 {
     PlayerbotAI* const botAI = GetBotAI(bot);
     if (!botAI || !botAI->GetAiObjectContext())
@@ -4248,11 +4249,95 @@ Creature* FindNearbyNpcWithFlag(Player* bot, uint32 npcFlag)
         if (!unit || unit->IsHostileTo(bot) || !unit->HasNpcFlag(static_cast<NPCFlags>(npcFlag)))
             continue;
 
+        if (requireInteraction && !bot->GetNPCIfCanInteractWith(guid, npcFlag))
+            continue;
+
         if (Creature* const creature = unit->ToCreature())
             return creature;
     }
 
     return nullptr;
+}
+
+uint32 MoveNaturalBankItem(Player* bot, Creature* banker, Item* item, bool deposit, std::string& reason)
+{
+    reason = "NATURAL_PROGRESSION";
+    if (!bot || !bot->GetSession() || bot->GetSession()->GetPlayer() != bot || !banker || !item ||
+        bot->GetNPCIfCanInteractWith(banker->GetGUID(), UNIT_NPC_FLAG_BANKER) != banker)
+        return 0;
+
+    uint32 const itemId = item->GetEntry();
+    uint32 const count = item->GetCount();
+    ObjectGuid const itemGuid = item->GetGUID();
+    uint32 const beforeCount = bot->GetItemCount(itemId, false);
+    uint8 const bag = item->GetBagSlot();
+    uint8 const slot = item->GetSlot();
+
+    if (deposit ? !bot->IsInventoryPos(bag, slot) : !bot->IsBankPos(bag, slot))
+    {
+        reason = "BAD_POSITION";
+        return 0;
+    }
+
+    WorldPacket activatePacket(CMSG_BANKER_ACTIVATE, 8);
+    activatePacket << banker->GetGUID();
+    bot->GetSession()->HandleBankerActivateOpcode(activatePacket);
+
+    // Require the actual banker; do not allow the core's self-bank command exemption.
+    if (bot->GetNPCIfCanInteractWith(banker->GetGUID(), UNIT_NPC_FLAG_BANKER) != banker)
+        return 0;
+
+    item = bot->GetItemByPos(bag, slot);
+    if (!item || item->GetGUID() != itemGuid || item->GetEntry() != itemId || item->GetCount() != count || !count)
+    {
+        reason = "SOURCE_STALE";
+        return 0;
+    }
+
+    ItemPosCountVec dest;
+    InventoryResult const msg = deposit
+        ? bot->CanBankItem(NULL_BAG, NULL_SLOT, dest, item, false)
+        : bot->CanStoreItem(NULL_BAG, NULL_SLOT, dest, item, false);
+    if (msg != EQUIP_ERR_OK)
+    {
+        reason = msg == EQUIP_ERR_BANK_FULL || msg == EQUIP_ERR_INVENTORY_FULL || msg == EQUIP_ERR_BAG_FULL
+            ? (deposit ? "BANK_FULL" : "BAGS_FULL") : "FAILED";
+        bot->SendEquipError(msg, item, nullptr);
+        return 0;
+    }
+
+    if (dest.empty() || (dest.size() == 1 && dest[0].pos == item->GetPos()))
+    {
+        reason = "FAILED";
+        bot->SendEquipError(EQUIP_ERR_NONE, item, nullptr);
+        return 0;
+    }
+
+    if (deposit)
+    {
+        // Completed objectives inspect inventory, so decrement before removing the stack.
+        bot->ItemRemovedQuestCheck(itemId, count);
+        bot->RemoveItem(bag, slot, true);
+        bot->BankItem(dest, item, true);
+        bot->UpdateTitansGrip();
+    }
+    else
+    {
+        bot->RemoveItem(bag, slot, true);
+        // StoreItem can merge and delete item; credit only the original transferred count.
+        if (bot->StoreItem(dest, item, true))
+            bot->ItemAddedQuestCheck(itemId, count);
+    }
+
+    uint32 const afterCount = bot->GetItemCount(itemId, false);
+    uint32 const moved = deposit
+        ? (beforeCount > afterCount ? beforeCount - afterCount : 0)
+        : (afterCount > beforeCount ? afterCount - beforeCount : 0);
+    if (moved != count)
+        reason = "POSTCONDITION_FAILED";
+    else
+        reason.clear();
+    return moved;
 }
 
 Creature* FindNearbyVendorSellingItem(Player* bot, uint32 itemId, uint32& vendorSlot, uint32& vendorExtendedCost, bool& sawVendor)
@@ -4902,12 +4987,54 @@ void SendTrainerPackets(Player* requester, ChatMsg replyType, std::string const&
     SendAddonPacket(requester, replyType, "TRAINER_END", headerPayload);
 }
 
-bool LearnTrainerSpell(Player* bot, SpellInfo const* spellInfo, uint32 cost, std::string& reason)
+bool LearnTrainerSpell(Player* bot, Creature* trainerCreature, SpellInfo const* spellInfo, uint32 cost,
+    std::string& reason)
 {
     if (!bot || !spellInfo)
     {
         reason = "NO_SPELL";
         return false;
+    }
+
+    if (sPlayerbotAIConfig.naturalProgression)
+    {
+        reason = "NATURAL_PROGRESSION";
+        if (!bot->GetSession() || !bot->IsInWorld() || !trainerCreature ||
+            !sPlayerbotAIConfig.AllowLearnTrainerSpells ||
+            bot->GetNPCIfCanInteractWith(trainerCreature->GetGUID(), UNIT_NPC_FLAG_TRAINER) != trainerCreature)
+            return false;
+
+        Trainer::Trainer* const trainer = sObjectMgr->GetTrainer(trainerCreature->GetEntry());
+        Trainer::Spell const* const trainerSpell = trainer ? trainer->GetSpell(spellInfo->Id) : nullptr;
+        if (!trainer || !trainerSpell || !trainer->IsTrainerValidForPlayer(bot) ||
+            !trainer->CanTeachSpell(bot, trainerSpell))
+            return false;
+
+        if (GetBotTrainerFreeMoney(bot) < cost)
+        {
+            reason = "TOO_EXPENSIVE";
+            return false;
+        }
+
+        // Use the core purchase path for prices, prerequisites and progression hooks.
+        WorldPacket packet(CMSG_TRAINER_BUY_SPELL, 8 + 4);
+        packet << trainerCreature->GetGUID() << spellInfo->Id;
+        WorldPackets::NPC::TrainerBuySpell buyPacket(std::move(packet));
+        buyPacket.Read();
+        bot->GetSession()->HandleTrainerBuySpellOpcode(buyPacket);
+
+        bool learned = bot->HasSpell(spellInfo->Id);
+        if (spellInfo->HasEffect(SPELL_EFFECT_LEARN_SPELL))
+        {
+            learned = true;
+            for (SpellEffectInfo const& effect : spellInfo->GetEffects())
+                if (effect.IsEffect(SPELL_EFFECT_LEARN_SPELL) && !bot->HasSpell(effect.TriggerSpell))
+                    learned = false;
+        }
+
+        if (learned)
+            reason = "OK";
+        return learned;
     }
 
     if (!BotHasGoldCheat(bot))
@@ -4966,6 +5093,18 @@ void RunTrainerLearnCommand(Player* requester, ChatMsg replyType, std::string co
         return;
     }
 
+    if (sPlayerbotAIConfig.naturalProgression)
+    {
+        PlayerbotAI* const botAI = GetBotAI(bot);
+        if (!bot->GetSession() || !bot->IsInWorld() || !botAI || !botAI->GetSecurity() ||
+            !botAI->GetSecurity()->CheckLevelFor(PLAYERBOT_SECURITY_ALLOW_ALL, true, requester))
+        {
+            SendTrainerLearnResult(requester, replyType, effectiveBotName, token, expectedTrainerEntry,
+                spellIdValue, false, "NATURAL_PROGRESSION", 0, 0);
+            return;
+        }
+    }
+
     if (!expectedTrainerEntry)
     {
         SendTrainerLearnResult(requester, replyType, effectiveBotName, token, expectedTrainerEntry, spellIdValue, false, "NO_TRAINER", 0, 0);
@@ -4982,6 +5121,8 @@ void RunTrainerLearnCommand(Player* requester, ChatMsg replyType, std::string co
     Creature* const trainerCreature = GetSelectedTrainer(requester, expectedTrainerEntry, trainerReason);
     if (!trainerCreature)
     {
+        if (sPlayerbotAIConfig.naturalProgression)
+            trainerReason = "NATURAL_PROGRESSION";
         SendTrainerLearnResult(requester, replyType, effectiveBotName, token, expectedTrainerEntry, spellIdValue, false, trainerReason, 0, 0);
         return;
     }
@@ -5009,15 +5150,20 @@ void RunTrainerLearnCommand(Player* requester, ChatMsg replyType, std::string co
             {
                 SpellInfo const* const spellInfo = sSpellMgr->GetSpellInfo(entry.spellId);
                 std::string learnReason;
-                if (LearnTrainerSpell(bot, spellInfo, entry.cost, learnReason))
+                uint32 const moneyBefore = bot->GetMoney();
+                if (LearnTrainerSpell(bot, trainerCreature, spellInfo, entry.cost, learnReason))
                 {
                     ++learnedCount;
                     ++learnedThisPass;
-                    spent += entry.cost;
+                    if (!sPlayerbotAIConfig.naturalProgression)
+                        spent += entry.cost;
                     reason = "OK";
                 }
                 else if (learnReason != "OK" && learnedCount == 0)
                     reason = learnReason;
+
+                if (sPlayerbotAIConfig.naturalProgression && moneyBefore > bot->GetMoney())
+                    spent += moneyBefore - bot->GetMoney();
             }
 
             if (learnedThisPass == 0)
@@ -5034,14 +5180,19 @@ void RunTrainerLearnCommand(Player* requester, ChatMsg replyType, std::string co
 
             SpellInfo const* const spellInfo = sSpellMgr->GetSpellInfo(entry.spellId);
             std::string learnReason;
-            if (LearnTrainerSpell(bot, spellInfo, entry.cost, learnReason))
+            uint32 const moneyBefore = bot->GetMoney();
+            if (LearnTrainerSpell(bot, trainerCreature, spellInfo, entry.cost, learnReason))
             {
                 ++learnedCount;
-                spent += entry.cost;
+                if (!sPlayerbotAIConfig.naturalProgression)
+                    spent += entry.cost;
                 reason = "OK";
             }
             else if (learnReason != "OK")
                 reason = learnReason;
+
+            if (sPlayerbotAIConfig.naturalProgression && moneyBefore > bot->GetMoney())
+                spent += moneyBefore - bot->GetMoney();
 
             break;
         }
@@ -5625,9 +5776,10 @@ uint32 MoveMatchingBagItemsToBank(Player* bot, uint32 itemId, uint32 requestedCo
         return 0;
     }
 
-    if (!FindNearbyNpcWithFlag(bot, UNIT_NPC_FLAG_BANKER))
+    Creature* const banker = FindNearbyNpcWithFlag(bot, UNIT_NPC_FLAG_BANKER, sPlayerbotAIConfig.naturalProgression);
+    if (!banker)
     {
-        reason = "BANKER_NOT_FOUND";
+        reason = sPlayerbotAIConfig.naturalProgression ? "NATURAL_PROGRESSION" : "BANKER_NOT_FOUND";
         return 0;
     }
 
@@ -5635,6 +5787,16 @@ uint32 MoveMatchingBagItemsToBank(Player* bot, uint32 itemId, uint32 requestedCo
     while (Item* const item = FindBagItemByEntry(bot, itemId))
     {
         uint32 const stackCount = item->GetCount();
+        if (sPlayerbotAIConfig.naturalProgression)
+        {
+            moved += MoveNaturalBankItem(bot, banker, item, true, reason);
+            if (!reason.empty())
+                return moved;
+            if (requestedCount > 0 && moved >= requestedCount)
+                break;
+            continue;
+        }
+
         ItemPosCountVec dest;
         InventoryResult const msg = bot->CanBankItem(NULL_BAG, NULL_SLOT, dest, item, false);
         if (msg != EQUIP_ERR_OK)
@@ -5651,7 +5813,7 @@ uint32 MoveMatchingBagItemsToBank(Player* bot, uint32 itemId, uint32 requestedCo
             break;
     }
 
-    if (!moved)
+    if (!moved || (sPlayerbotAIConfig.naturalProgression && requestedCount > moved))
         reason = "ITEM_NOT_FOUND";
 
     return moved;
@@ -5665,9 +5827,10 @@ uint32 MoveMatchingBankItemsToBags(Player* bot, uint32 itemId, uint32 requestedC
         return 0;
     }
 
-    if (!FindNearbyNpcWithFlag(bot, UNIT_NPC_FLAG_BANKER))
+    Creature* const banker = FindNearbyNpcWithFlag(bot, UNIT_NPC_FLAG_BANKER, sPlayerbotAIConfig.naturalProgression);
+    if (!banker)
     {
-        reason = "BANKER_NOT_FOUND";
+        reason = sPlayerbotAIConfig.naturalProgression ? "NATURAL_PROGRESSION" : "BANKER_NOT_FOUND";
         return 0;
     }
 
@@ -5675,6 +5838,16 @@ uint32 MoveMatchingBankItemsToBags(Player* bot, uint32 itemId, uint32 requestedC
     while (Item* const item = FindBankItemByEntry(bot, itemId))
     {
         uint32 const stackCount = item->GetCount();
+        if (sPlayerbotAIConfig.naturalProgression)
+        {
+            moved += MoveNaturalBankItem(bot, banker, item, false, reason);
+            if (!reason.empty())
+                return moved;
+            if (requestedCount > 0 && moved >= requestedCount)
+                break;
+            continue;
+        }
+
         ItemPosCountVec dest;
         InventoryResult const msg = bot->CanStoreItem(NULL_BAG, NULL_SLOT, dest, item, false);
         if (msg != EQUIP_ERR_OK)
@@ -5691,7 +5864,7 @@ uint32 MoveMatchingBankItemsToBags(Player* bot, uint32 itemId, uint32 requestedC
             break;
     }
 
-    if (!moved)
+    if (!moved || (sPlayerbotAIConfig.naturalProgression && requestedCount > moved))
         reason = "ITEM_NOT_FOUND";
 
     return moved;
@@ -6810,6 +6983,8 @@ void RunTalentApplyCommand(
 
     if (!requester || !requester->GetSession())
         reason = "BAD_REQUEST";
+    else if (sPlayerbotAIConfig.naturalProgression)
+        reason = "NATURAL_PROGRESSION";
     else if (!ConsumeTalentApplyRateLimit(requester))
         reason = "RATE_LIMIT";
     else if (!RegisterTalentApplyToken(requester, token))
@@ -6993,6 +7168,8 @@ void RunTalentSpecApplyCommand(
 
     if (!requester || !requester->GetSession())
         reason = "BAD_REQUEST";
+    else if (sPlayerbotAIConfig.naturalProgression)
+        reason = "NATURAL_PROGRESSION";
     else if (!ConsumeTalentSpecApplyRateLimit(requester))
         reason = "RATE_LIMIT";
     else if (!RegisterTalentSpecApplyToken(requester, token))
@@ -7216,6 +7393,8 @@ void RunGlyphEquipCommand(
 
     if (!requester || !requester->GetSession())
         reason = "BAD_REQUEST";
+    else if (sPlayerbotAIConfig.naturalProgression)
+        reason = "NATURAL_PROGRESSION";
     else if (!ConsumeGlyphEquipRateLimit(requester))
         reason = "RATE_LIMIT";
     else if (!RegisterGlyphEquipToken(requester, token))
@@ -7928,8 +8107,12 @@ void RunInventoryItemDepositExactCommand(
                     reason = "SOURCE_STALE";
                 else if (action == "BANK_DEPOSIT")
                 {
-                    if (!FindNearbyNpcWithFlag(bot, UNIT_NPC_FLAG_BANKER))
-                        reason = "BANKER_NOT_FOUND";
+                    Creature* const banker =
+                        FindNearbyNpcWithFlag(bot, UNIT_NPC_FLAG_BANKER, sPlayerbotAIConfig.naturalProgression);
+                    if (!banker)
+                        reason = sPlayerbotAIConfig.naturalProgression ? "NATURAL_PROGRESSION" : "BANKER_NOT_FOUND";
+                    else if (sPlayerbotAIConfig.naturalProgression)
+                        moved = MoveNaturalBankItem(bot, banker, sourceItem, true, reason);
                     else
                     {
                         ItemPosCountVec dest;
@@ -9077,7 +9260,9 @@ void RunInventoryItemActionCommand(Player* requester, ChatMsg replyType, std::st
             reason = "BAD_ACTION";
     }
 
-    bool const ok = moved > 0;
+    bool const naturalBankAction = sPlayerbotAIConfig.naturalProgression &&
+        (action == "BANK_DEPOSIT" || action == "BANK_WITHDRAW");
+    bool const ok = moved > 0 && (!naturalBankAction || reason.empty());
     if (ok)
         reason = "OK";
     else if (reason.empty())
@@ -10506,6 +10691,12 @@ bool CreateManagedHunterPet(
         return false;
     }
 
+    if (sPlayerbotAIConfig.naturalProgression)
+    {
+        reason = "NATURAL_PROGRESSION";
+        return false;
+    }
+
     CreatureTemplate const* const creature = sObjectMgr->GetCreatureTemplate(creatureEntry);
     if (!creature)
     {
@@ -10926,6 +11117,13 @@ void RunHunterPetManageCommand(
     if (!ResolveHunterPetControlBot(requester, botName, bot, botAI, reason))
     {
         SendHunterPetManageAck(requester, replyType, token, botName, action, 0, "", reason);
+        return;
+    }
+
+    if (sPlayerbotAIConfig.naturalProgression &&
+        (action == "RENAME" || action == "CALL" || action == "DISMISS"))
+    {
+        SendHunterPetManageAck(requester, replyType, token, botName, action, 0, "", "NATURAL_PROGRESSION");
         return;
     }
 
@@ -15265,7 +15463,9 @@ void ApplyPreparedAutogear(Player* requester, ChatMsg replyType,
 
     Player* bot = nullptr;
     uint32 qualityCap = 0, ilvlCap = 0, quality = 0, ilvl = 0;
-    if (std::chrono::steady_clock::now() - plan.created > std::chrono::seconds(30))
+    if (sPlayerbotAIConfig.naturalProgression)
+        result.reason = "NATURAL_PROGRESSION";
+    else if (std::chrono::steady_clock::now() - plan.created > std::chrono::seconds(30))
         result.reason = "PLAN_EXPIRED";
     else if (!ResolveAutogearTarget(requester, plan.botName, bot, qualityCap, ilvlCap, result.reason))
     {
@@ -15961,6 +16161,12 @@ bool ApplyMaintenanceToBot(Player* bot, PlayerbotAI* botAI, std::string& reason)
         return false;
     }
 
+    if (sPlayerbotAIConfig.naturalProgression)
+    {
+        reason = "NATURAL_PROGRESSION";
+        return false;
+    }
+
     if (!PLAYERBOT_CONFIG(MaintenanceCommand, maintenanceCommand))
     {
         reason = "DISABLED";
@@ -16265,6 +16471,8 @@ void RunSelfActionCommand(
         reason = "NO_SESSION";
     else if (!IsSelfBot(requester))
         reason = "NOT_SELF_BOT";
+    else if (sPlayerbotAIConfig.naturalProgression && (action == "AUTOGEAR" || action == "MAINTENANCE"))
+        reason = "NATURAL_PROGRESSION";
     else if (!ConsumeSelfBotRequestRateLimit(requester))
         reason = "RATE_LIMIT";
     else if ((action == "AUTOGEAR" || action == "MAINTENANCE") &&
