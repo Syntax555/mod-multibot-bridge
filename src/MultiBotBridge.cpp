@@ -34,6 +34,7 @@
 #include "AttackAction.h"
 #include "AiObjectContext.h"
 #include "AiFactory.h"
+#include "EraTalentBridge.h"
 #include "Event.h"
 #include "EventProcessor.h"
 #include "Strategy.h"
@@ -1072,6 +1073,16 @@ std::array<uint32, 3> BuildTalentTabPoints(Player* bot)
     std::array<uint32, 3> tabs = {0, 0, 0};
     if (!bot)
         return tabs;
+
+    // Custom era talent points are stored separately from the native talent map.
+    uint32 eraTabs[3] = {0, 0, 0};
+    if (EraTalentBots_SpecTabs(bot, eraTabs))
+    {
+        tabs[0] = eraTabs[0];
+        tabs[1] = eraTabs[1];
+        tabs[2] = eraTabs[2];
+        return tabs;
+    }
 
     uint8 const activeSpecMask = bot->GetActiveSpecMask();
 
