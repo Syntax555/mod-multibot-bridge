@@ -76,15 +76,19 @@ NPC, route, scripted objective or encounter works. Full in-game coverage remains
 
 ## Configuration and troubleshooting
 
-`conf/MultiBotBridge.conf.dist` contains one module option:
+`conf/MultiBotBridge.conf.dist` contains the diagnostic options:
 
 ```ini
 MultiBotBridge.EnableConsoleLogs = 0
+MultiBotBridge.EnableFileLogs = 0
 ```
 
 The portable installation places it at `configs/modules/MultiBotBridge.conf`.
-Set it to `1` for bridge startup/RX/TX diagnostics. Gameplay rules are configured
-in Playerbots, Individual Progression and Era Talents; preserve the portable
+Set `EnableConsoleLogs` to `1` for bridge startup/RX/TX diagnostics. Optional
+`EnableFileLogs` writes packet metadata and rejections to `MultiBotBridge.log`
+under the worldserver's configured `LogsDir`; it retains four files of up to
+16 MiB each. Both are disabled by default. Gameplay rules are configured in
+Playerbots, Individual Progression and Era Talents; preserve the portable
 profiles when updating.
 
 If the addon reports the bridge unavailable, confirm that the running
@@ -104,8 +108,8 @@ Source fixtures do not certify every UI interaction or gameplay path.
 
 This fork retains
 [Wishmaster117/mod-multibot-bridge](https://github.com/Wishmaster117/mod-multibot-bridge)
-at [`ebfa01a129dd`](https://github.com/Wishmaster117/mod-multibot-bridge/commit/ebfa01a129dd4c441b2527e42dcc37b6da95e6c2).
-The [imported README](https://github.com/Wishmaster117/mod-multibot-bridge/blob/ebfa01a129dd4c441b2527e42dcc37b6da95e6c2/README.md)
+at [`9f0e8ba767c6`](https://github.com/Wishmaster117/mod-multibot-bridge/commit/9f0e8ba767c65f7959a615f70e61ec0980266780).
+The [imported README](https://github.com/Wishmaster117/mod-multibot-bridge/blob/9f0e8ba767c65f7959a615f70e61ec0980266780/README.md)
 provides the original project's broader protocol and development background,
 including credits to AzerothCore, Playerbots and historical Jellypowered bridge
 contributions. Its upstream feature and runtime claims do not define this
