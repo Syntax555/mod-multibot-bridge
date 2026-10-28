@@ -1500,7 +1500,8 @@ std::string BuildTalentLinkPointSummary(std::string const& link)
 
 std::string GetPremadeSpecConfigString(std::string const& key)
 {
-    return Trim(sConfigMgr->GetOption<std::string>(key, ""));
+    // Unconfigured preset slots and level variants are optional.
+    return Trim(sConfigMgr->GetOption<std::string>(key, "", false));
 }
 
 std::string GetPremadeSpecLink(uint8 classId, uint32 specIndex, uint32 botLevel)
