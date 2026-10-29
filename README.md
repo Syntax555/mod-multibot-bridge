@@ -37,6 +37,9 @@ realm's earned-play rules:
 - Bots train, repair, buy and bank through ordinary nearby NPC interactions,
   using their own money and items. Class training follows their own earned era
   and talent/quest prerequisites.
+- Natural-mode personal-bank transfers use the native session handler and
+  report actual moved quantities. Banker access, source identity and session
+  ownership are checked before transfer; the matching core updates quest counts.
 - Natural progression refuses generated autogear, free maintenance and preset
   or bulk talent application. Respecs use paid trainers. For historical trees,
   the matching EraTalents addon lets owners manually spend grouped altbots'

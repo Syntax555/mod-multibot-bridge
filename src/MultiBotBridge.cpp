@@ -1,4 +1,5 @@
 #include "Bag.h"
+#include "BankPackets.h"
 #include "Chat.h"
 #include "CharacterCache.h"
 #include "Config.h"
@@ -5123,21 +5124,11 @@ uint32 MoveNaturalBankItem(Player* bot, Creature* banker, Item* item, bool depos
         return 0;
     }
 
-    if (deposit)
-    {
-        // Completed objectives inspect inventory, so decrement before removing the stack.
-        bot->ItemRemovedQuestCheck(itemId, count);
-        bot->RemoveItem(bag, slot, true);
-        bot->BankItem(dest, item, true);
-        bot->UpdateTitansGrip();
-    }
-    else
-    {
-        bot->RemoveItem(bag, slot, true);
-        // StoreItem can merge and delete item; credit only the original transferred count.
-        if (bot->StoreItem(dest, item, true))
-            bot->ItemAddedQuestCheck(itemId, count);
-    }
+    WorldPacket movePacket(CMSG_AUTOSTORE_BANK_ITEM, 2);
+    movePacket << bag << slot;
+    WorldPackets::Bank::AutoStoreBankItem move(std::move(movePacket));
+    move.Read();
+    bot->GetSession()->HandleAutoStoreBankItemOpcode(move);
 
     uint32 const afterCount = bot->GetItemCount(itemId, false);
     uint32 const moved = deposit
