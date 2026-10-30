@@ -38,7 +38,6 @@
 #include "AttackAction.h"
 #include "AiObjectContext.h"
 #include "AiFactory.h"
-#include "EraTalentBridge.h"
 #include "MultiBotBridgeProgression.h"
 #include "Event.h"
 #include "EventProcessor.h"
@@ -1378,62 +1377,14 @@ std::string GetClassName(uint8 classId)
     }
 }
 
-uint32 GetTalentRankPoints(TalentEntry const* talentInfo, uint32 spellId)
-{
-    if (!talentInfo)
-        return 1;
-
-    for (uint8 rank = 0; rank < MAX_TALENT_RANK; ++rank)
-    {
-        if (talentInfo->RankID[rank] == spellId)
-            return rank + 1;
-    }
-
-    return 1;
-}
-
+// Playerbots' totals include historical era trees and only the active specialization.
 std::array<uint32, 3> BuildTalentTabPoints(Player* bot)
 {
-    std::array<uint32, 3> tabs = {0, 0, 0};
     if (!bot)
-        return tabs;
+        return {0, 0, 0};
 
-    // Custom era talent points are stored separately from the native talent map.
-    uint32 eraTabs[3] = {0, 0, 0};
-    if (EraTalentBots_SpecTabs(bot, eraTabs))
-    {
-        tabs[0] = eraTabs[0];
-        tabs[1] = eraTabs[1];
-        tabs[2] = eraTabs[2];
-        return tabs;
-    }
-
-    uint8 const activeSpecMask = bot->GetActiveSpecMask();
-
-    for (PlayerTalentMap::const_iterator it = bot->GetTalentMap().begin(); it != bot->GetTalentMap().end(); ++it)
-    {
-        PlayerTalent const* const playerTalent = it->second;
-        if (!playerTalent)
-            continue;
-
-        if (playerTalent->State == PLAYERSPELL_REMOVED)
-            continue;
-
-        if (playerTalent->specMask && !(playerTalent->specMask & activeSpecMask))
-            continue;
-
-        TalentEntry const* const talentInfo = sTalentStore.LookupEntry(playerTalent->talentID);
-        if (!talentInfo)
-            continue;
-
-        TalentTabEntry const* const talentTab = sTalentTabStore.LookupEntry(talentInfo->TalentTab);
-        if (!talentTab || talentTab->tabpage >= tabs.size())
-            continue;
-
-        tabs[talentTab->tabpage] += GetTalentRankPoints(talentInfo, it->first);
-    }
-
-    return tabs;
+    std::map<uint8, uint32> tabs = AiFactory::GetPlayerSpecTabs(bot);
+    return {tabs[0], tabs[1], tabs[2]};
 }
 
 uint32 BuildItemLevelScore(Player* bot)
