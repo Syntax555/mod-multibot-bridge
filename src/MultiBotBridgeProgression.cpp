@@ -76,6 +76,7 @@ std::map<std::string, IpVisibilityRule, std::less<>> const& IpVisibilityRules()
         {"npc_ipp_tbc", [](Player* target) { return sIndividualProgression->hasPassedProgression(target, PROGRESSION_PRE_TBC); }},
         {"npc_ipp_tbc_pre_t3", [](Player* target) { return !sIndividualProgression->hasPassedProgression(target,PROGRESSION_TBC_TIER_2); }},
         {"npc_ipp_tbc_t3", [](Player* target) { return sIndividualProgression->hasPassedProgression(target, PROGRESSION_TBC_TIER_2); }},
+        {"npc_ipp_tbc_t4", [](Player* target) { return sIndividualProgression->hasPassedProgression(target, PROGRESSION_TBC_TIER_4); }},
         {"npc_ipp_za", [](Player* target) { return sIndividualProgression->GetPlayerProgressionFromQuests(target) >= static_cast<ProgressionState>(sIndividualProgression->RequiredZulAmanProgression); }},
         {"npc_ipp_pre_wotlk", [](Player* target) { return sIndividualProgression->isBeforeProgression(target, PROGRESSION_TBC_TIER_5); }},
         {"npc_ipp_wotlk", [](Player* target) { return sIndividualProgression->hasPassedProgression(target, PROGRESSION_TBC_TIER_5); }},
